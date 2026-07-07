@@ -1,0 +1,14 @@
+[package]
+name = "redistrie-ffi"
+version = "0.1.0"
+edition = "2024"
+
+# Mirrors the C compile flag TRIE_32BIT_RUNES: off => rune is uint16_t (BMP only),
+# on => rune is uint32_t (full Unicode). The ABI of every rune-taking function
+# changes with this, so it is a compile-time choice, exactly as in C.
+[features]
+default = []
+runes_32bit = []
+
+[lib]
+crate-type = ["staticlib", "rlib"]
