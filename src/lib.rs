@@ -2,10 +2,10 @@
 //! (`src/trie/trie.h` + `src/trie/rune_util.h`).
 //!
 //! This is a *signature + safety-doc sketch*: the bodies are `todo!()` on
-//! purpose. The goal is the shape of a memory-safe, drop-in-compatible C API,
-//! and an explicit account of who allocates and frees what. See README.md for
-//! the reasoning; the per-function `# Safety` sections are the contract a C
-//! caller must uphold.
+//! purpose. The goal is the shape of a memory-safe, *safer-compatible* C API
+//! (near-drop-in, with a few deliberate and documented deviations — see
+//! README.md §3), and an explicit account of who allocates and frees what. The
+//! per-function `# Safety` sections are the contract a C caller must uphold.
 //!
 //! Design in one paragraph: the trie itself is Rust-owned and handed to C as an
 //! opaque `*mut TrieMap` — C never sees its layout, so the Rust side is free to
@@ -48,18 +48,25 @@ pub struct TrieMap {
 /// How the map orders entries — mirrors `TrieSortMode` in C.
 ///
 /// `#[repr(C)]` fixes the discriminant values so the enum is ABI-compatible.
-/// (Values assumed from the C header; confirm against `trie.h` before shipping.)
+/// Values match the C enum exactly: `Trie_Sort_Lex = 0`, `Trie_Sort_Score = 1`.
+/// (Getting these backwards is a silent ABI bug — C would ask for one ordering
+/// and Rust would apply the other — so they are pinned to the C values here.)
 #[repr(C)]
 pub enum TrieSortMode {
-    Score = 0,
-    Lex = 1,
+    Lex = 0,
+    Score = 1,
 }
 
-/// Payload attached to an entry — mirrors `RSPayload { char *data; uint32_t len; }`.
+/// A `(ptr, len)` view over payload bytes — matches `RSPayload { char *data;
+/// uint32_t len; }`, which is the payload type the C `Trie_Insert*` functions
+/// already take, so insertion stays byte-for-byte compatible.
 ///
-/// `data` points at caller-owned bytes that are *borrowed* for the duration of
-/// an insert call; the trie copies whatever it needs to retain (see README on
-/// payload ownership).
+/// Note: internally the C trie *stores* payloads as `TriePayload { uint32_t len;
+/// char data[]; }` (a flexible-array-member struct). That type is deliberately
+/// **not** exposed across the FFI: FAM structs are awkward and error-prone to
+/// construct from Rust, and callers only ever need a view. On insert `data` is
+/// borrowed and copied in; on lookup ([`Trie_Find`]) the same `(ptr, len)` shape
+/// is handed back as a borrowed view over the trie-owned `TriePayload`.
 #[repr(C)]
 pub struct RSPayload {
     pub data: *mut c_char,
@@ -93,8 +100,8 @@ pub unsafe extern "C" fn Trie_New(
 /// Destroy a trie and every entry/payload it owns (invoking the free callback
 /// per payload). After this call the pointer is dangling and must not be reused.
 ///
-/// This replaces `TrieType_Free(void*)`; see README for why the signature is
-/// typed rather than `void*`.
+/// This is the typed destructor; the existing `void`-typed
+/// [`TrieType_Free`] is kept as a shim that forwards here (see README §3).
 ///
 /// # Safety
 /// - `t` must be a non-null pointer returned by [`Trie_New`] and not already freed.
@@ -103,6 +110,19 @@ pub unsafe extern "C" fn Trie_New(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Trie_Free(t: *mut TrieMap) {
     let _ = t;
+    todo!()
+}
+
+/// Drop-in shim for the existing `void`-typed destructor. RediSearch registers
+/// `TrieType_Free(void*)` in its Redis type table, so the exact symbol must keep
+/// existing; it simply forwards to [`Trie_Free`]. Direct callers should prefer
+/// the typed [`Trie_Free`].
+///
+/// # Safety
+/// - `value` must be null or a pointer returned by [`Trie_New`], not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TrieType_Free(value: *mut c_void) {
+    let _ = value; // forwards to Trie_Free(value as *mut TrieMap)
     todo!()
 }
 

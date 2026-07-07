@@ -1,16 +1,23 @@
 # RediSearch rune trie — Rust FFI sketch
 
-A signature-level sketch of a safe FFI surface for a Rust re-implementation of
-RediSearch's rune trie (`src/trie/trie.h`, `src/trie/rune_util.h`). Bodies are
-`todo!()` on purpose — the deliverable is the API shape, the safety contracts,
-and the memory-ownership model. `cargo build` (and `cargo build --features
-runes_32bit`) both compile, so the signatures type-check against both ABIs.
+A signature-level sketch of a **safer-compatible** FFI surface (near-drop-in for
+`src/trie/trie.h` + `src/trie/rune_util.h`, with a few deliberate deviations
+called out in §3) for a Rust re-implementation of RediSearch's rune trie. Bodies
+are `todo!()` on purpose — the deliverable is the API shape, the safety
+contracts, and the memory-ownership model. `cargo build` (and `cargo build
+--features runes_32bit`) both compile, so the signatures type-check against both
+ABIs.
 
 ## 1. What actually needs exposing
 
-Walking `trie.h` / `rune_util.h` for symbols used *outside* the module and
-dropping everything iteration-related (`TrieIterator`, `Trie_Iterate*`,
-`Trie_CollectFuzzy`, `Trie_GetNode`'s offset machinery), the basic surface is:
+**How I scoped this:** the exercise is "what's used *outside* the module". In a
+real port I'd `grep` the codebase for call sites of each symbol and keep only
+those referenced outside `src/trie/*` — e.g. `grep -rn "Trie_Insert\|NewTrie\|
+Trie_Delete\|Trie_GetNode\|TrieType_Free" src/ --include=*.c` — then drop
+anything only reachable from the trie's own `.c`/tests. Working from the headers
+here, that leaves the basic lifecycle/CRUD surface below, and drops everything
+iteration-related (`TrieIterator`, `Trie_Iterate*`, `Trie_CollectFuzzy`, and
+`Trie_GetNode`'s shared-prefix offset machinery):
 
 | Concern      | C API                                              | Rust FFI here |
 |--------------|----------------------------------------------------|---------------|
@@ -18,7 +25,7 @@ dropping everything iteration-related (`TrieIterator`, `Trie_Iterate*`,
 | Insert       | `Trie_InsertRune`, `Trie_InsertStringBuffer`       | `Trie_InsertRunes`, `Trie_InsertStringBuffer` |
 | Find         | `Trie_GetNode(...)` (opaque node + offset)          | `Trie_Find` (see §3) |
 | Remove       | `Trie_DeleteRunes`, `Trie_Delete`                  | `Trie_DeleteRunes`, `Trie_Delete` |
-| Destroy      | `TrieType_Free(void*)`                             | `Trie_Free(*mut TrieMap)` |
+| Destroy      | `TrieType_Free(void*)`                             | `Trie_Free(*mut TrieMap)` + `TrieType_Free` shim |
 | Size         | `Trie_Size`                                         | `Trie_Size` |
 | Rune convert | `strToRunes`, `runesToStr`                          | `Trie_StrToRunes`, `Trie_RunesToStr` (+ frees) |
 
@@ -44,12 +51,17 @@ This is the crux of doing the FFI safely. Four categories, each with one owner:
 2. **Input keys** (`*const rune` / `*const c_char`). Caller-owned, **borrowed**
    for the duration of the call. Rust copies whatever it stores into its own
    nodes, so the caller's buffer can be freed immediately after the call.
-3. **Payloads.** On insert the payload bytes are borrowed and copied into the
-   trie, which then *owns* its copy. On remove/destroy the trie frees each owned
-   payload through the `TrieFreeCallback` — preserving the C contract where the
-   caller supplies the destructor. `Trie_Find` hands back a **borrowed** view
-   (`RSPayload` pointing at trie-owned bytes) valid only until the next mutation;
-   documented per-function so a caller knows to copy, not free.
+3. **Payloads.** Insert takes the C API's own `RSPayload { char *data; uint32_t
+   len; }` (a `ptr+len` view); the bytes are borrowed and copied into the trie,
+   which then *owns* its copy. Internally the C trie stores payloads as
+   `TriePayload { uint32_t len; char data[]; }` (a flexible-array-member struct) —
+   that type is kept off the FFI boundary on purpose, since FAM structs are
+   awkward and unsafe to build from Rust and callers only need a view. On
+   remove/destroy the trie frees each owned payload through the
+   `TrieFreeCallback`, preserving the C contract where the caller supplies the
+   destructor. `Trie_Find` hands back a **borrowed** `RSPayload` view over the
+   trie-owned `TriePayload`, valid only until the next mutation — documented
+   per-function so a caller knows to copy, not free.
 4. **Buffers Rust returns** (`Trie_StrToRunes`, `Trie_RunesToStr`). Rust-allocated,
    so they must return through `Trie_FreeRunes` / `Trie_FreeStr`. **This is the
    one place a naive drop-in would be unsound:** the C `rune_util.h` returns
@@ -59,6 +71,11 @@ This is the crux of doing the FFI safely. Four categories, each with one owner:
 
 ## 3. Where I diverge from the C API, and why
 
+This is a *safer-compatible* surface, not a 100% drop-in: insertion, deletion,
+sizing and the rune converters keep the C signatures, but three things change on
+purpose. Each is a safety/ergonomics win, and each has a compatibility escape
+hatch.
+
 - **`Trie_Find` instead of `Trie_GetNode`.** `Trie_GetNode` returns an opaque
   `TrieNode*` plus a shared-prefix `offsetOut` — that shape exists to support
   iteration and fuzzy traversal, which are explicitly out of scope. For "does
@@ -66,13 +83,15 @@ This is the crux of doing the FFI safely. Four categories, each with one owner:
   out-params is simpler, leaks no internal node type across the boundary, and
   keeps the Rust structure free to change. If exposing nodes later proves
   necessary, that's an opaque `*mut TrieNode` handle with accessor functions —
-  never the raw struct.
-- **Explicit `Trie_Free*` functions** for returned buffers (see §2.4).
-- **Typed `Trie_Free(*mut TrieMap)`** rather than `TrieType_Free(void*)`. The
-  `void*` form exists so Redis's generic type-table can call it; a typed wrapper
-  is safer for direct callers, and a `void*` shim can trivially forward to it if
-  the module registration still needs that exact symbol.
-- Dropped the `RedisModuleString` insert overload (§1).
+  never the raw struct. *(This is the one signature a caller of `Trie_GetNode`
+  would have to adapt to.)*
+- **Explicit `Trie_FreeRunes` / `Trie_FreeStr`** for Rust-allocated buffers
+  (see §2.4) — additive, no existing signature changes.
+- **Typed `Trie_Free(*mut TrieMap)`** as the primary destructor, **but
+  `TrieType_Free(void*)` is kept** as a thin shim forwarding to it, so the exact
+  symbol Redis's type-table registers still exists. Additive, fully compatible.
+- Dropped the `RedisModuleString` insert overload (§1) — callers use the
+  string-buffer form.
 
 ## 4. Safety-doc convention
 
